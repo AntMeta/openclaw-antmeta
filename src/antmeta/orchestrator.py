@@ -2,8 +2,11 @@
 编排器 - 核心协调逻辑
 """
 
+import html
+import json
 import os
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -20,6 +23,12 @@ class Orchestrator:
     
     协调多 Agent 团队的安全执行
     """
+    
+    # 安全常量
+    MAX_SOUL_MD_LENGTH = 10000
+    MAX_AGENTS_MD_LENGTH = 10000
+    MAX_TASK_LENGTH = 5000
+    MAX_MESSAGE_LENGTH = 5000
     
     def __init__(self, data_dir: Optional[Path] = None):
         self.team_manager = TeamManager(data_dir)
@@ -42,7 +51,12 @@ class Orchestrator:
         Returns:
             创建的团队对象
         """
-        return self.team_manager.create_team(name, description, leader)
+        team = self.team_manager.create_team(name, description, leader)
+        
+        # 记录审计日志
+        self._log_audit_event(name, "team_created", f"Team '{name}' created by {leader}")
+        
+        return team
     
     def add_member(
         self,
@@ -81,14 +95,16 @@ class Orchestrator:
             for key, value in security_override.items():
                 setattr(security, key, value)
         
-        # 创建工作目录
+        # 创建工作目录（安全权限）
         member_workspace = team.workspace_dir / member_name
         member_workspace.mkdir(exist_ok=True)
+        # 设置目录权限为仅所有者可读写执行
+        os.chmod(member_workspace, 0o700)
         
         # 准备子会话环境
         env = self._prepare_session_env(team, role, member_name, task, security)
         
-        # 构建任务提示（注入角色定义）
+        # 构建任务提示（注入角色定义）- 已清理防止注入
         prompt = self._build_task_prompt(role, task, team.name)
         
         # 启动隔离子会话
@@ -128,6 +144,13 @@ class Orchestrator:
             "workspace": str(member_workspace),
         }
         
+        # 记录审计日志
+        self._log_audit_event(
+            team_name, 
+            "member_added", 
+            f"Member '{member_name}' with role '{role.name}' added"
+        )
+        
         return member
     
     def send_message(
@@ -150,14 +173,17 @@ class Orchestrator:
         if not member or not member.session_key:
             return False
         
+        # 清理消息防止注入
+        safe_message = self._sanitize_message(message)
+        
         # 实际实现中调用 sessions_send
         # sessions_send(
         #     session_key=member.session_key,
-        #     message=f"[{message_type}] {message}"
+        #     message=f"[{message_type}] {safe_message}"
         # )
         
         # 记录到团队日志
-        self._log_message(team_name, to_member, message, message_type)
+        self._log_message(team_name, to_member, safe_message, message_type)
         return True
     
     def broadcast(
@@ -171,10 +197,13 @@ class Orchestrator:
         if not team:
             return 0
         
+        # 清理消息
+        safe_message = self._sanitize_message(message)
+        
         count = 0
         for member in team.members:
             if member.session_key and member.status == MemberStatus.WORKING:
-                if self.send_message(team_name, member.name, message, message_type):
+                if self.send_message(team_name, member.name, safe_message, message_type):
                     count += 1
         
         return count
@@ -226,6 +255,9 @@ class Orchestrator:
             if status:
                 results.append(status)
         
+        # 记录审计日志
+        self._log_audit_event(team_name, "parallel_orchestration", f"Collected {len(results)} member statuses")
+        
         return results
     
     def orchestrate_sequential(
@@ -246,7 +278,30 @@ class Orchestrator:
             if status:
                 results.append(status)
         
+        # 记录审计日志
+        self._log_audit_event(team_name, "sequential_orchestration", f"Executed {len(results)} members in sequence")
+        
         return results
+    
+    def _sanitize_message(self, message: str) -> str:
+        """
+        清理消息内容，防止注入攻击
+        
+        Args:
+            message: 原始消息
+            
+        Returns:
+            清理后的安全消息
+        """
+        if not message:
+            return ""
+        
+        # 截断超长消息
+        if len(message) > self.MAX_MESSAGE_LENGTH:
+            message = message[:self.MAX_MESSAGE_LENGTH - 3] + "..."
+        
+        # HTML 转义防止注入
+        return html.escape(message)
     
     def _prepare_session_env(
         self,
@@ -257,17 +312,21 @@ class Orchestrator:
         security: SecurityProfile
     ) -> Dict[str, str]:
         """准备子会话环境变量"""
+        # 清理角色定义防止注入
+        safe_soul = html.escape(role.soul_md[:self.MAX_SOUL_MD_LENGTH])
+        safe_agents = html.escape(role.agents_md[:self.MAX_AGENTS_MD_LENGTH])
+        
         env = {
             # 团队信息
-            "ANTMETA_TEAM": team.name,
-            "ANTMETA_MEMBER": member_name,
-            "ANTMETA_ROLE": role.name,
-            "ANTMETA_TASK": task,
+            "ANTMETA_TEAM": html.escape(team.name),
+            "ANTMETA_MEMBER": html.escape(member_name),
+            "ANTMETA_ROLE": html.escape(role.name),
+            "ANTMETA_TASK": html.escape(task[:self.MAX_TASK_LENGTH]),
             "ANTMETA_WORKSPACE": str(team.workspace_dir / member_name),
             
-            # 角色定义
-            "ANTMETA_ROLE_SOUL": role.soul_md,
-            "ANTMETA_ROLE_AGENTS": role.agents_md,
+            # 角色定义（已清理）
+            "ANTMETA_ROLE_SOUL": safe_soul,
+            "ANTMETA_ROLE_AGENTS": safe_agents,
             
             # 安全策略
             **security.to_env_dict(),
@@ -286,22 +345,28 @@ class Orchestrator:
         task: str,
         team_name: str
     ) -> str:
-        """构建注入角色定义的任务提示"""
+        """构建注入角色定义的任务提示（已清理防止注入）"""
+        # 清理所有输入
+        safe_soul = html.escape(role.soul_md[:self.MAX_SOUL_MD_LENGTH])
+        safe_agents = html.escape(role.agents_md[:self.MAX_AGENTS_MD_LENGTH])
+        safe_task = html.escape(task[:self.MAX_TASK_LENGTH])
+        safe_team = html.escape(team_name)
+        
         return f"""# 蚁元 / AntMeta - 团队任务
 
-你现在是团队 "{team_name}" 的一员，扮演以下角色：
+你现在是团队 "{safe_team}" 的一员，扮演以下角色：
 
 ## 🎭 角色身份 / Role Identity
 
-{role.soul_md}
+{safe_soul}
 
 ## 📋 工作流程 / Workflow
 
-{role.agents_md}
+{safe_agents}
 
 ## 🎯 当前任务 / Current Task
 
-{task}
+{safe_task}
 
 ## 💬 协调指令 / Coordination Protocol
 
@@ -329,10 +394,7 @@ class Orchestrator:
         message: str,
         message_type: str
     ) -> None:
-        """记录消息到团队日志"""
-        import json
-        from datetime import datetime
-        
+        """记录消息到团队日志（安全权限）"""
         log_entry = {
             "timestamp": datetime.now().isoformat(),
             "to": to_member,
@@ -341,7 +403,40 @@ class Orchestrator:
         }
         
         log_file = self.team_manager.data_dir / team_name / "logs" / "messages.jsonl"
-        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         
         with open(log_file, "a") as f:
             f.write(json.dumps(log_entry) + "\n")
+        
+        # 设置日志文件权限为仅所有者可读写
+        os.chmod(log_file, 0o600)
+    
+    def _log_audit_event(
+        self,
+        team_name: str,
+        event_type: str,
+        description: str
+    ) -> None:
+        """
+        记录审计日志
+        
+        Args:
+            team_name: 团队名称
+            event_type: 事件类型
+            description: 事件描述
+        """
+        audit_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "team": team_name,
+            "event_type": event_type,
+            "description": description,
+        }
+        
+        audit_file = self.team_manager.data_dir / team_name / "logs" / "audit.jsonl"
+        audit_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        
+        with open(audit_file, "a") as f:
+            f.write(json.dumps(audit_entry) + "\n")
+        
+        # 设置审计日志文件权限
+        os.chmod(audit_file, 0o600)
