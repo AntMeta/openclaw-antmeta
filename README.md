@@ -1,4 +1,4 @@
-# 蚁元 / AntMeta
+# 蚁元 / AntMeta（目前存在问题，请待修复完成后使用）
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+">
